@@ -9,7 +9,7 @@ services:
     environment:
       GOOGLE_APPLICATION_CREDENTIALS: /app/secrets/adc.json
     ports:
-      - "8000:8000"
+      - "8088:8000"
     volumes:
       - ./artifacts:/app/artifacts
       - ./secrets/adc.json:/app/secrets/adc.json:ro

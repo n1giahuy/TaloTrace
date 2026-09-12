@@ -62,7 +62,6 @@ def _generate_video_sync(plan: VideoPlan, job_id: str) -> ArtifactResult:
         "resolution": settings.veo_resolution,
         "person_generation": "dont_allow",
         "generate_audio": True,
-        "enhance_prompt": False,
     }
 
     if settings.veo_output_gcs_uri:
@@ -72,7 +71,7 @@ def _generate_video_sync(plan: VideoPlan, job_id: str) -> ArtifactResult:
     logger.info("Submitting Veo generation for job %s", job_id)
     operation = client.models.generate_videos(
         model=settings.veo_model,
-        prompt=plan.veo_prompt,
+        source=types.GenerateVideosSource(prompt=plan.veo_prompt),
         config=types.GenerateVideosConfig(**config_kwargs),
     )
 
@@ -80,10 +79,42 @@ def _generate_video_sync(plan: VideoPlan, job_id: str) -> ArtifactResult:
         time.sleep(settings.veo_poll_seconds)
         operation = client.operations.get(operation)
 
-    response = operation.response or operation.result
-    generated_videos = getattr(response, "generated_videos", None) if response else None
+    operation_error = getattr(operation, "error", None)
+    response = operation.result or operation.response
+    generated_videos = getattr(response, "generated_videos", None) or []
+    rai_media_filtered_count = (
+        getattr(response, "rai_media_filtered_count", None) if response else None
+    )
+    rai_media_filtered_reasons = (
+        getattr(response, "rai_media_filtered_reasons", None) if response else None
+    )
+
+    logger.info(
+        "Veo operation completed for job %s: operation=%s error=%s "
+        "generated_video_count=%s rai_media_filtered_count=%s "
+        "rai_media_filtered_reasons=%s",
+        job_id,
+        operation.name,
+        operation_error,
+        len(generated_videos),
+        rai_media_filtered_count,
+        rai_media_filtered_reasons,
+    )
+
+    if operation_error:
+        raise RuntimeError(f"Veo operation failed: {operation_error}")
+
     if not generated_videos:
-        raise RuntimeError("Veo completed without returning a generated video.")
+        if rai_media_filtered_count:
+            raise RuntimeError(
+                "Veo output was filtered by RAI policies: "
+                f"{rai_media_filtered_reasons or 'no reason provided'}"
+            )
+        raise RuntimeError(
+            "Veo completed without returning a generated video "
+            f"(rai_media_filtered_count={rai_media_filtered_count}, "
+            f"rai_media_filtered_reasons={rai_media_filtered_reasons})."
+        )
 
     video = generated_videos[0].video
     if video is None:
@@ -112,7 +143,7 @@ async def generate_video(ctx: Context, node_input: VideoPlan) -> ArtifactResult:
 # P1 deliberately has no retry policy yet. Phase 2 can add RetryConfig and
 # stronger quality gates without changing the workflow boundary.
 generate_video_node = FunctionNode(
-    generate_video,
+    func=generate_video,
     name="generate_video",
     timeout=600,
 )

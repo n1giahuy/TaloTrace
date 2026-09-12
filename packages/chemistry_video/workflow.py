@@ -1,5 +1,4 @@
-from google.adk import START, Workflow
-from google.adk.workflow import FunctionNode
+from google.adk.workflow import FunctionNode, START, Workflow
 
 from packages.chemistry_video.agents.prompt_refiner import prompt_refiner
 from packages.chemistry_video.nodes.generate_video import generate_video_node
@@ -7,7 +6,7 @@ from packages.chemistry_video.nodes.validate_plan import validate_plan
 
 
 validate_plan_node = FunctionNode(
-    validate_plan,
+    func=validate_plan,
     name="validate_plan",
 )
 
