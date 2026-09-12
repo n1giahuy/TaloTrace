@@ -1,10 +1,12 @@
-# AI Chemistry Video Request Service — Phase 1
+# AI Chemistry Video Request Service
 
-Backend-only Phase 1 vertical slice for the coding challenge:
+Backend-only prototype for generating short educational chemistry videos from learner questions.
 
-`FastAPI -> async job -> ADK 2.0 Workflow -> Gemini 3.1 Flash-Lite -> Veo 3.1 Lite -> MP4 artifact`
+```text
+FastAPI -> async job -> ADK 2.x Workflow -> Gemini 3.1 Flash-Lite -> VideoPlan -> Veo 3.1 Lite -> MP4 artifact
+```
 
-P1 intentionally keeps persistence in memory and does **not** add a test suite, docs folder, queue, database, retry policy, or production worker yet.
+The service intentionally stays lightweight: in-memory jobs, local artifact storage, Docker Compose, and no frontend, database, external queue, or test harness.
 
 ## Architecture
 
@@ -30,13 +32,48 @@ ADK Runner -> App -> Workflow
                artifacts/<job-id>.mp4
 ```
 
-ADK owns orchestration. Gemini owns the uncertain reasoning/refinement step. Python code owns job lifecycle and the deterministic Veo call boundary.
+ADK owns deterministic orchestration. Gemini handles prompt refinement into a structured Pydantic `VideoPlan`. Python code validates that plan, calls Veo, saves the MP4 locally, and verifies the finished artifact before the job is marked completed.
 
-## GCP setup
+## Job Lifecycle
 
-You need a billed Google Cloud project with access/quota for the selected models.
+`POST /jobs` returns HTTP `202` with a job id and initial `queued` status. The background task moves the job to `processing`, runs the ADK workflow, and finishes as either:
 
-Enable the Vertex AI API:
+- `completed`: local MP4 exists, is non-empty, and contains both video and audio streams.
+- `failed`: Gemini, Veo, safety/RAI filtering, empty output, artifact download, or MP4 validation failed with a clear error.
+
+Public states remain:
+
+```text
+queued
+processing
+completed
+failed
+```
+
+## Generation Boundary
+
+Gemini and Veo are configured separately because Gemini can use `global` while Veo is regional. Veo generates native audio through `generate_audio=True`; there is no separate TTS or audio muxing step.
+
+The Veo node logs the `job_id`, completed operation name, provider error, generated video count, `rai_media_filtered_count`, and `rai_media_filtered_reasons` when available. This keeps provider errors, safety filtering, empty results, and artifact validation failures distinguishable in Docker logs.
+
+## Persistence and Artifacts
+
+Job state is stored in memory and resets when the container restarts. MP4s are stored under `./artifacts` through the Compose volume mount. The final submission videos under `artifacts/*.mp4` are not ignored by `.gitignore`, so they can be committed when needed.
+
+## Cost Notes
+
+The demo uses one 8-second 720p video per required prompt and requests one output video per job. There are no retries by default, no extra VLM scoring pass, and no duplicate generation step, keeping Phase 2 cost predictable.
+
+## Known Limitations
+
+- Jobs are in-memory only.
+- Work is processed by FastAPI background asyncio tasks in one container.
+- Artifact validation checks container-level MP4 structure, not educational quality.
+- GCP project access, model availability, regional Veo quota, billing, and ADC credentials must be configured outside the app.
+
+## GCP Setup
+
+Enable Vertex AI in a billed Google Cloud project with access to the selected models:
 
 ```bash
 gcloud services enable aiplatform.googleapis.com --project YOUR_PROJECT_ID
@@ -52,90 +89,35 @@ cp ~/.config/gcloud/application_default_credentials.json secrets/adc.json
 
 The credentials file is mounted read-only into Docker and is gitignored.
 
-> `gemini-3.1-flash-lite` uses the `global` endpoint. `veo-3.1-lite-generate-001` is configured separately for `us-central1`.
-
 ## Configure
 
-```bash
-cp .env.example .env
-nano .env
-```
-
-At minimum replace:
+Create `.env` with at least:
 
 ```env
 GOOGLE_CLOUD_PROJECT=your-gcp-project-id
+GOOGLE_CLOUD_LOCATION=global
+GEMINI_MODEL=gemini-3.1-flash-lite
+VEO_MODEL=veo-3.1-lite-generate-001
+VEO_LOCATION=us-central1
+ARTIFACT_DIR=/app/artifacts
 ```
 
-Optional: if direct generated-video download is unavailable for your model access, create a GCS bucket and set `VEO_OUTPUT_GCS_URI=gs://...`. The code can download a returned `gs://` artifact back into the local `artifacts/` directory.
+Optional: set `VEO_OUTPUT_GCS_URI=gs://...` if your Veo access returns GCS artifacts instead of directly downloadable video bytes.
 
 ## Run
 
-Use this command at the start of P1 and again after changes in later phases:
-
 ```bash
 sudo docker compose up -d --build
-```
-
-Logs:
-
-```bash
-sudo docker compose logs -f api
+sudo docker compose logs --tail=200 api
 ```
 
 Health check:
 
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:8088/health
 ```
 
-## Acceptance run
-
-### 1. pH scale
-
-```bash
-curl -s -X POST http://localhost:8000/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"How does the pH scale work?"}'
-```
-
-### 2. Covalent bonds
-
-```bash
-curl -s -X POST http://localhost:8000/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"Why do atoms form covalent bonds?"}'
-```
-
-### 3. Ionic vs covalent
-
-```bash
-curl -s -X POST http://localhost:8000/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"What is the difference between ionic and covalent bonding?"}'
-```
-
-Each POST returns HTTP `202` and a job id. Poll it:
-
-```bash
-curl -s http://localhost:8000/jobs/JOB_ID
-```
-
-List all jobs:
-
-```bash
-curl -s http://localhost:8000/jobs
-```
-
-When `status` becomes `completed`, download/open the artifact:
-
-```bash
-curl -L http://localhost:8000/jobs/JOB_ID/artifact -o result.mp4
-```
-
-The generated file is also persisted on the host under `./artifacts/`.
-
-## P1 API
+## API
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -145,6 +127,18 @@ The generated file is also persisted on the host under `./artifacts/`.
 | `GET` | `/jobs/{id}` | Poll status |
 | `GET` | `/jobs/{id}/artifact` | Retrieve completed MP4 |
 
-## Phase boundary
+## Demo
 
-P1 is deliberately the real end-to-end slice. Phase 2 should evolve this same repo with ADK `RetryConfig`, stronger plan/artifact quality gates, clearer failure taxonomy and concurrency controls. Phase 3 should focus on observability, submission polish and the final three committed generated videos.
+Run the existing script against the Docker API on port `8088`:
+
+```bash
+bash scripts/run_demo.sh
+```
+
+It submits the three required prompts, polls each job to completion, downloads the artifacts through FastAPI, and writes:
+
+```text
+artifacts/demo_ph_scale.mp4
+artifacts/demo_covalent_bonds.mp4
+artifacts/demo_ionic_vs_covalent.mp4
+```

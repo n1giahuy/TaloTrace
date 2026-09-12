@@ -43,6 +43,7 @@ class JobService:
                 status=JobStatus.PROCESSING,
                 error=None,
             )
+            logger.info("Video job %s processing", job_id)
 
             result = await self._runtime.generate(job_id=job_id, query=job.query)
 
@@ -52,7 +53,12 @@ class JobService:
                 artifact_path=result.artifact_path,
                 error=None,
             )
-        except Exception as exc:  # P1 keeps one understandable failure boundary.
+            logger.info(
+                "Video job %s completed: artifact_path=%s",
+                job_id,
+                result.artifact_path,
+            )
+        except Exception as exc:
             logger.exception("Video job %s failed", job_id)
             await self._repository.update(
                 job_id,

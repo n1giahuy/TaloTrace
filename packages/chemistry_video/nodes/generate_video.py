@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import subprocess
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -44,6 +46,67 @@ def _save_generated_video(client: genai.Client, video: types.Video, destination:
     # then use its public save() helper.
     client.files.download(file=video)
     video.save(destination)
+
+
+def _validate_mp4_artifact(path: Path, job_id: str) -> None:
+    if not path.exists():
+        raise RuntimeError(
+            f"Artifact validation failed for job {job_id}: file is missing."
+        )
+    if path.stat().st_size <= 0:
+        raise RuntimeError(
+            f"Artifact validation failed for job {job_id}: file is empty."
+        )
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_streams",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("Artifact validation failed: ffprobe is not installed.") from exc
+
+    if result.returncode != 0:
+        detail = (
+            result.stderr.strip() or result.stdout.strip() or "unknown ffprobe error"
+        )
+        raise RuntimeError(
+            f"Artifact validation failed for job {job_id}: {detail}"
+        )
+
+    try:
+        streams = json.loads(result.stdout or "{}").get("streams", [])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Artifact validation failed for job {job_id}: invalid ffprobe output."
+        ) from exc
+    stream_types = {stream.get("codec_type") for stream in streams}
+    if "video" not in stream_types:
+        raise RuntimeError(
+            f"Artifact validation failed for job {job_id}: no video stream."
+        )
+    if "audio" not in stream_types:
+        raise RuntimeError(
+            f"Artifact validation failed for job {job_id}: no audio stream."
+        )
+
+    logger.info(
+        "Artifact validation passed for job %s: path=%s size_bytes=%s streams=%s",
+        job_id,
+        path,
+        path.stat().st_size,
+        sorted(stream_type for stream_type in stream_types if stream_type),
+    )
 
 
 def _generate_video_sync(plan: VideoPlan, job_id: str) -> ArtifactResult:
@@ -121,9 +184,7 @@ def _generate_video_sync(plan: VideoPlan, job_id: str) -> ArtifactResult:
         raise RuntimeError("Veo returned an empty video object.")
 
     _save_generated_video(client, video, destination)
-
-    if not destination.exists() or destination.stat().st_size <= 0:
-        raise RuntimeError("Generated video was not saved as a valid local artifact.")
+    _validate_mp4_artifact(destination, job_id)
 
     return ArtifactResult(
         artifact_path=str(destination),
@@ -140,8 +201,7 @@ async def generate_video(ctx: Context, node_input: VideoPlan) -> ArtifactResult:
     return await asyncio.to_thread(_generate_video_sync, node_input, job_id)
 
 
-# P1 deliberately has no retry policy yet. Phase 2 can add RetryConfig and
-# stronger quality gates without changing the workflow boundary.
+# Keep retries out of Phase 2 unless a specific transient failure is identified.
 generate_video_node = FunctionNode(
     func=generate_video,
     name="generate_video",
